@@ -1,11 +1,15 @@
+use std::sync::RwLock;
+
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use aegis_core::{compiler, loader};
+use serde_json::Value;
 
 #[derive(Debug)]
 struct Backend {
-    client: Client
+    client: Client,
+    symbols: RwLock<Vec<CompletionItem>>
 }
 
 #[tower_lsp::async_trait]
@@ -46,21 +50,27 @@ impl LanguageServer for Backend {
 
     // 3. Autocomplétion
     async fn completion(&self, _: CompletionParams) -> Result<Option<CompletionResponse>> {
+        // 1. Liste de base (Mots-clés)
         let keywords = vec![
             "var", "func", "if", "else", "while", "for", "return", 
             "class", "new", "import", "try", "catch", "namespace",
-            "Math", "Http", "Json", "System"
+            "true", "false", "null"
         ];
 
-        let items: Vec<CompletionItem> = keywords
+        let mut items: Vec<CompletionItem> = keywords
             .into_iter()
             .map(|k| CompletionItem {
                 label: k.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                detail: Some("Aegis Keyword".to_string()),
                 ..Default::default()
             })
             .collect();
+
+        // 2. Ajouter les symboles découverts dynamiquement
+        if let Ok(read_guard) = self.symbols.read() {
+            // On clone pour renvoyer la liste
+            items.extend(read_guard.clone());
+        }
 
         Ok(Some(CompletionResponse::Array(items)))
     }
@@ -75,22 +85,26 @@ impl Backend {
     async fn validate_document(&self, uri: Url, text: String) {
         let mut diagnostics = Vec::new();
 
-        // 1. On essaie de compiler
         match compiler::compile(&text) {
             Ok(json_ast) => {
-                // 2. Si compile OK, on essaie de loader
+                // 1. Mise à jour des symboles pour l'autocomplétion
+                let found_symbols = self.extract_symbols(&json_ast);
+                
+                // On met à jour le RwLock
+                if let Ok(mut write_guard) = self.symbols.write() {
+                    *write_guard = found_symbols;
+                }
+
+                // 2. Validation Loader (inchangée)
                 if let Err(e) = loader::parse_block(&json_ast) {
-                    // Erreur Loader
                     diagnostics.push(self.parse_error_message(&e));
                 }
             },
             Err(e) => {
-                // Erreur Parser
                 diagnostics.push(self.parse_error_message(&e));
             }
         }
 
-        // On envoie les erreurs (ou liste vide si tout va bien) à l'éditeur
         self.client.publish_diagnostics(uri, diagnostics, None).await;
     }
 
@@ -130,6 +144,100 @@ impl Backend {
             ..Default::default()
         }
     }
+
+    fn extract_symbols(&self, ast: &Value) -> Vec<CompletionItem> {
+        let mut symbols = Vec::new();
+
+        if let Some(arr) = ast.as_array() {
+            // Si le premier élément est une string, c'est une instruction unique
+            if !arr.is_empty() && arr[0].is_string() {
+                self.analyze_instruction(arr, &mut symbols);
+            } else {
+                // Sinon c'est une liste d'instructions
+                for item in arr {
+                    let sub_symbols = self.extract_symbols(item);
+                    symbols.extend(sub_symbols);
+                }
+            }
+        }
+
+        symbols
+    }
+
+    fn analyze_instruction(&self, arr: &Vec<Value>, symbols: &mut Vec<CompletionItem>) {
+        if arr.is_empty() { return; }
+        
+        // CORRECTION 1 : as_str() sur serde_json renvoie Option<&str>
+        let cmd = arr[0].as_str().unwrap_or(""); 
+        
+        match cmd {
+            "set" => {
+                // ["set", line, "nom_var", ...]
+                // CORRECTION 2 : on utilise get(2) car index 1 est la ligne
+                if let Some(name) = arr.get(2).and_then(|v| v.as_str()) {
+                    symbols.push(CompletionItem {
+                        label: name.to_string(),
+                        kind: Some(CompletionItemKind::VARIABLE),
+                        detail: Some("Variable".to_string()),
+                        ..Default::default()
+                    });
+                }
+            },
+            "function" => {
+                // ["function", line, "nom_func", params, ret, body]
+                if let Some(name) = arr.get(2).and_then(|v| v.as_str()) {
+                    symbols.push(CompletionItem {
+                        label: name.to_string(),
+                        kind: Some(CompletionItemKind::FUNCTION),
+                        detail: Some("Function".to_string()),
+                        insert_text: Some(format!("{}($0)", name)),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+                // Récursion body (index 5)
+                if let Some(body) = arr.get(5) {
+                    self.extract_symbols(body).into_iter().for_each(|s| symbols.push(s));
+                }
+            },
+            "class" => {
+                // ["class", line, "Name", ...]
+                if let Some(name) = arr.get(2).and_then(|v| v.as_str()) {
+                    symbols.push(CompletionItem {
+                        label: name.to_string(),
+                        kind: Some(CompletionItemKind::CLASS),
+                        detail: Some("Class".to_string()),
+                        ..Default::default()
+                    });
+                }
+            },
+            "namespace" => {
+                // ["namespace", line, "Name", body]
+                if let Some(name) = arr.get(2).and_then(|v| v.as_str()) {
+                    symbols.push(CompletionItem {
+                        label: name.to_string(),
+                        kind: Some(CompletionItemKind::MODULE),
+                        detail: Some("Namespace".to_string()),
+                        ..Default::default()
+                    });
+                }
+                // Récursion body (index 3)
+                if let Some(body) = arr.get(3) {
+                    self.extract_symbols(body).into_iter().for_each(|s| symbols.push(s));
+                }
+            },
+            
+            // Blocs récursifs
+            "if" | "while" | "for_range" => {
+                // On scanne les arguments à partir de l'index 2
+                for arg in &arr[2..] {
+                    self.extract_symbols(arg).into_iter().for_each(|s| symbols.push(s));
+                }
+            },
+            
+            _ => {}
+        }
+    }
 }
 
 #[tokio::main]
@@ -137,6 +245,9 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend { client });
+    let (service, socket) = LspService::new(|client| Backend { 
+        client,
+        symbols: RwLock::new(Vec::new())
+    });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
